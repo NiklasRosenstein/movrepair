@@ -253,6 +253,8 @@ def main():
     def transform(node):
       if isinstance(node, tuple) and type(node).__name__ in vars(movfile):
         node = transform({'type': type(node).__name__, 'data': node._asdict()})
+      elif isinstance(node, tuple) and hasattr(node, '_asdict'):
+        node = transform(node._asdict())
       elif isinstance(node, list):
         node = [transform(x) for x in node]
       elif isinstance(node, dict):
