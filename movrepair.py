@@ -19,314 +19,37 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-"""
-References:
 
-* http://mirror.informatimago.com/next/developer.apple.com/documentation/QuickTime/APIREF/INDEX/atomalphaindex.htm
-* https://developer.apple.com/library/content/documentation/QuickTime/QTFF/QTFFChap2/qtff2.html#//apple_ref/doc/uid/TP40000939-CH204-56313
-"""
 
 from __future__ import division, print_function
+from movio import MovFileError, MovAtomR, MovAtomD, MovAtomW, get_file_size_via_seek
+import movfile
 import argparse
 import collections
-import io
+import json
 import os
 import struct
 import sys
 
 
-class MovFileError(Exception):
-  pass
 
 
-class MovAtomR(object):
-  """
-  Represents a section in a readable file-like object that can be interpreted
-  as a .MOV atom. To use this object, #read_header() should be called first
-  to fill the #size and #tag members.
-  """
 
-  @classmethod
-  def make_root(cls, fp):
-    ar = cls(fp, is_root_atom=True)
-    ar.is_root_atom = True
-    return ar
-
-  def __init__(self, fp, is_root_atom=False):
-    self.file = fp
-    self.size = 0
-    self.tag = None
-    self.bytes_read = 0
-    self.atom_begin = None
-    self.is_root_atom = is_root_atom
-    if self.is_root_atom:
-      self.size = get_file_size_via_seek(fp)
-
-  def __repr__(self):
-    if self.is_root_atom:
-      return '<MovAtomR (root)>'
-    else:
-      return '<MovAtomR size={!r} tag={!r}>'.format(self.size, self.tag)
-
-  def read_header(self):
-    """
-    Extracts the .MOV header of this atom from the current file position.
-    Raises a #RuntimeError if the header for this atom has already been read.
-    """
-
-    if self.is_root_atom:
-      raise RuntimeError('can not read header of root MovAtomR')
-    if self.bytes_read != 0:
-      raise RuntimeError('atom header already read')
-    self.atom_begin = self.file.tell()
-    header = self.file.read(8)
-    if len(header) != 8:
-      raise MovFileError('reached EOF while reading atom header')
-    self.size = struct.unpack('>I', header[:4])[0]
-    self.tag = header[4:]
-    self.bytes_read = 8
-
-  def read_data(self, length=None, allow_incomplete=False):
-    """
-    Reads the data of this atom. If the header of this atom has not been read
-    yet, it will be done automatically. If *allow_incomplete* is #False, a
-    #MovFileError will be raised if not the full contents could be read.
-
-    If *length* is not #None, only *length* bytes will be read at max. Calling
-    this method again will read the next *length* bytes or to the end of the
-    atom.
-    """
-
-    if self.is_root_atom:
-      raise RuntimeError('can not read data from root MovAtomR')
-    if self.bytes_read == 0:
-      self.read_header()
-    nbytes = self.size - self.bytes_read
-    assert nbytes >= 0
-    if length is not None:
-      nbytes = min(nbytes, length)
-    data = self.file.read(nbytes)
-    self.bytes_read += len(data)
-    if len(data) != nbytes and not allow_incomplete:
-      raise MovFileError('reached EOF while reading "{}" atom data'.format(
-        self.tag.decode('ascii', 'ignore')))
-    return data
-
-  def iter_data(self, chunksize, allow_incomplete=False):
-    while True:
-      data = self.read_data(chunksize, allow_incomplete)
-      if not data: break
-      yield data
-
-  def skip(self):
-    """
-    Skip over the contents of this atom. Does nothing if the data of this atom
-    has already been read with #read_data(). This is used in #iter_atoms() to
-    ensure that the file points to the next atom in the next step of iteration.
-    """
-
-    if self.bytes_read == 0:
-      self.read_header()
-    nbytes = self.size - self.bytes_read
-    assert nbytes >= 0
-    if nbytes > 0:
-      self.file.seek(nbytes, os.SEEK_CUR)
-      self.bytes_read += nbytes
-
-  def iter_atoms(self):
-    """
-    Creates a new #MovAtomR for every sub-atom. The header of this atom will
-    already be read.
-    """
-
-    if not self.is_root_atom and self.bytes_read == 0:
-      self.read_header()
-    while self.bytes_read < self.size:
-      atom = type(self)(self.file)
-      atom.read_header()
-      yield atom
-      atom.skip()
-      self.bytes_read += atom.bytes_read
-    if not self.is_root_atom and self.bytes_read != self.size:
-      raise MovFileError('sub-atoms exceed parent atom size: "{}"'.format(
-        self.tag.decode('ascii', 'ignore')))
-
-  def to_atomd(self):
-    """
-    Converts this atom to a #MovAtomD object. Requires that no data of this
-    atom has been read past the header.
-    """
-
-    if self.is_root_atom:
-      raise ValueError('can not convert root MovAtomR to MovAtomD')
-    if self.bytes_read == 0:
-      self.read_header()
-    if self.bytes_read != 8:
-      raise RuntimeError('MovAtomR data has already been read past '
-          'header, can not convert to MovAtomD')
-    return MovAtomD(self.tag, self.read_data())
+def guess_sequence_repitition_length(seq):
+  # Thanks to https://stackoverflow.com/a/11385797/791713
+  guess = 1
+  max_len = len(seq) // 2
+  for x in range(2, max_len):
+    if seq[0:x] == seq[x:2*x] :
+      return x
+  return guess
 
 
-class MovAtomD(object):
-  """
-  Represents a full .MOV atom in memory (not streaming from a file, like
-  #MovAtomR). This atom may either contain either a block of raw data (leaf
-  node), or other atoms.
-
-  Once a #MovAtomD instance is obtained (eg. by converting from a #MovAtomR),
-  it will most likely be in leaf-node form. However, if the atom type is known
-  to contain sub-atoms, it can be split into sub-atoms using #subatomize()
-  function or #iter_atoms() method.
-  """
-
-  def __init__(self, tag, data=None, atoms=None):
-    assert isinstance(tag, bytes), type(tag)
-    assert len(tag) == 4, len(tag)
-    self.tag = tag
-    self.data = data
-    self.atoms = atoms
-
-  def __repr__(self):
-    if self.is_leaf():
-      return '<MovAtomD tag={!r} size={} (leaf)>'.format(self.tag, self.calculate_size())
-    else:
-      return '<MovAtomD tag={!r} size={} len(atoms)={}>'.format(self.tag, self.calculate_size(), len(self.atoms))
-
-  def is_leaf(self):
-    return self.atoms is None
-
-  def edit(self):
-    """
-    Ensures that the #data member of this #MovAtomD is a #bytearray object.
-    If this is not a leaf-atom, a #RuntimeError will be raised.
-    """
-
-    if not self.is_leaf():
-      raise RuntimeError('can not use MovAtomD.edit() on non-leaf atom')
-    if not isinstance(self.data, bytearray):
-      self.data = bytearray(self.data)
-    return self.data
-
-  def split(self):
-    """
-    Given this is a leaf-atom, splits the #data of the atom assuming that it
-    contains sub-atoms. The #data member will be set to #None and the #atoms
-    member will contain a list of the sub-atoms (as #MovAtomD).
-    """
-
-    if not self.is_leaf():
-      raise ValueError('MovAtomD is already split')
-    fp, self.data = io.BytesIO(self.data), None
-    self.atoms = [x.to_atomd() for x in MovAtomR.make_root(fp).iter_atoms()]
-    return self
-
-  def iter_atoms(self):
-    """
-    Iterates over the sub-atoms of this atom. If the atom is still treated as
-    a leaf-node, #split() will be used automatically.
-    """
-
-    if self.is_leaf():
-      self.split()
-    return iter(self.atoms)
-
-  def find_atoms(self, *tpath):
-    """
-    Finds sub-atoms by tag-name. Automatically uses #split() on any matching
-    sub-atom. *tpath* must be one or more tag names. The first tag-name is
-    resolved in this atom, the second tag-name in the respectively matching
-    tag-name, etc.
-
-    Returns a list of matching atoms.
-    """
-
-    result = []
-    def recurse(atom, curr, *tpath):
-      for sub_atom in atom.iter_atoms():
-        if sub_atom.tag == curr:
-          if not tpath:
-            result.append(sub_atom)
-          else:
-            recurse(sub_atom, *tpath)
-    recurse(self, *tpath)
-    return result
-
-  def calculate_size(self):
-    if self.is_leaf():
-      return len(self.data) + 8
-    else:
-      return sum(x.calculate_size() for x in self.atoms) + 8
-
-  def write(self, fp):
-    """
-    Write this atom to a file.
-    """
-
-    size = self.calculate_size()
-    with MovAtomW(fp, size, self.tag) as writer:
-      if self.is_leaf():
-        writer.write(self.data)
-      else:
-        for atom in self.atoms:
-          atom.write(writer)
-
-
-class MovAtomW(object):
-  """
-  A write-only .MOV atom.
-  """
-
-  @classmethod
-  def make_root(cls, fp):
-    return cls(fp, None, None)
-
-  def __init__(self, fp, size, tag):
-    if tag is not None:
-      assert isinstance(tag, bytes), type(tag)
-      assert len(tag) == 4, len(tag)
-      if size < 8:
-        raise MovFileError('atom size must be >= 8 (atom: "{}")'.format(
-            tag.decode('ascii', 'ignore')))
-      fp.write(struct.pack('>I', size))
-      fp.write(tag)
-      self.bytes_written = 8
-    else:
-      assert size is None
-      self.bytes_written = 0
-    self.file = fp
-    self.size = size
-    self.tag = tag
-
-  def __enter__(self):
-    return self
-
-  def __exit__(self, e_type, e_val, e_tb):
-    if e_val is None:
-      self.finalize()
-
-  @property
-  def is_root_atom(self):
-    return self.size is None
-
-  def write(self, data):
-    if not self.is_root_atom and self.bytes_written + len(data) > self.size:
-      raise MovFileError('atom "{}" data excess'.format(self.tag.decode('ascii', 'ignore')))
-    self.file.write(data)
-    self.bytes_written += len(data)
-
-  def finalize(self):
-    if not self.is_root_atom and self.bytes_written != self.size:
-      raise MovFileError('atom "{}" data size mismatch (got {}, expected {})'
-          .format(self.tag.decode('ascii', 'ignore'), self.bytes_written, self.size))
-
-
-def get_file_size_via_seek(fp):
-  pos = fp.tell()
-  fp.seek(0, os.SEEK_END)
-  try:
-    return fp.tell()
-  finally:
-    fp.seek(pos)
+def calc_item_delta(sequence):
+  result = []
+  for i in range(1, len(sequence)):
+    result.append(sequence[i] - sequence[i-1])
+  return result
 
 
 def sizeof_fmt(num, suffix='B'):
@@ -382,24 +105,29 @@ def repair_file(reference, broken, output):
 
   # We assume that the header of the mdat is broken and we need to adjust
   # for the atoms after the mdat section (#end_file_offset).
-  mdat_size = get_file_size_via_seek(mdat.file) - mdat.atom_begin - end_file_offset
+  mdat_size = get_file_size_via_seek(mdat.file) - mdat.atom_begin# - end_file_offset
   print('Broken file\'s mdat size adjusted from {} to {}'.format(
       sizeof_fmt(mdat.size), sizeof_fmt(mdat_size)))
   mdat.size = mdat_size
+
+  # TESTING
+  moov = movfile.moov.unpack(reference_atoms[b'moov'].data)
+  print(moov)
+  return
 
   # Find a new duration for the new file based on the size of the reference
   # file's duration and sample size in bytes.
   def get_new_duration(atom):
     time_scale, ref_duration = struct.unpack('>II', atom.data[12:20])
-    new_duration = int(round(mdat.size / reference_atoms[b'mdat'].size * ref_duration))
+    new_duration = int(mdat.size / reference_atoms[b'mdat'].size * ref_duration)
     print('Adjusting "{}" duration from {}s to {}s.'.format(
         atom.tag.decode('ascii', 'ignore'),
         ref_duration/time_scale,
         new_duration/time_scale))
-    return new_duration
+    return ref_duration, new_duration
   moov = reference_atoms[b'moov']
   mvhd = moov.find_atoms(b'mvhd')[0]
-  new_duration = get_new_duration(mvhd)
+  ref_duration, new_duration = get_new_duration(mvhd)
   new_duration_packed = struct.pack('>I', new_duration)
 
   updated_atoms = []
@@ -419,9 +147,77 @@ def repair_file(reference, broken, output):
     elst.edit()[:] = struct.pack('>IIIII', *values)
   for mdhd in moov.find_atoms(b'trak', b'mdia', b'mdhd'):
     updated_atoms.append(mdhd)
-    mdhd.edit()[16:20] = struct.pack('>I', get_new_duration(mdhd))
+    mdhd_dur = get_new_duration(mdhd)[1]
+    mdhd.edit()[16:20] = struct.pack('>I', mdhd_dur)
+
+  # Adjust the sample information for the changed duration and sample count.
+  scale_factor = new_duration / ref_duration
+  for minf in moov.find_atoms(b'trak', b'mdia', b'minf'):
+    vmhd = next(iter(minf.find_atoms(b'vmhd')), None)
+    for stbl in minf.find_atoms(b'stbl'):
+
+      # Sample description atom
+      desc_atom = stbl.find_atoms(b'stsd')[0]
+      desc = movfile.stsd.unpack(desc_atom.data)
+
+      if desc.desc[0].fmt == b'tmcd':
+        print('Removing tmcd track')
+        assert minf.parent.parent.tag == b'trak'
+        moov.atoms.remove(minf.parent.parent)
+
+      # Time-to-sample atom
+      stts_atom = stbl.find_atoms(b'stts')[0]
+      stts = movfile.stts.unpack(stts_atom.data)
+      if desc.desc[0].fmt != b'tmcd':
+        table = []
+        for nsamples, sample_duration in stts.table:
+          nsamples_new = int(nsamples * scale_factor)
+          print('Adjusting sample count from {} to {}'.format(nsamples, nsamples_new))
+          table.append((nsamples_new, sample_duration))
+        stts_atom.data = stts.pack()
+        updated_atoms.append(stts_atom)
+
+      # Sync Sample atom
+      #stss_atom = stbl.find_atoms(b'stss')[0]
+      #stss = StssAtom.unpack(stss_atom.data)
+
+      # Sample-to-chunk atom
+      stsc_atom = stbl.find_atoms(b'stsc')[0]
+      stsc = movfile.stsc.unpack(stsc_atom.data)
+
+      # Chunk Offset atom
+      stco_atom = stbl.find_atoms(b'stco')[0]
+      stco = movfile.stco.unpack(stco_atom.data)
+      if len(stco.table) > 1:
+        print('Extending {} chunk offset table'.format(desc.desc[0].fmt))
+        count = int(len(stco.table) * scale_factor)
+        deltas = calc_item_delta(stco.table)
+        repn = guess_sequence_repitition_length(deltas)
+        offset = len(deltas) % repn
+        for i in range(count-len(stco.table)):
+          delta = deltas[offset+(i%repn)]
+          stco.table.append(stco.table[-1]+delta)
+        updated_atoms.append(stco_atom)
+
+      # Sample Size atom
+      stsz_atom = stbl.find_atoms(b'stsz')[0]
+      stsz = movfile.stsz.unpack(stsz_atom.data)
+      if len(stsz.table) > 1:
+        print('Extending {} sample size table'.format(desc.desc[0].fmt))
+        count = int(len(stsz.table) * scale_factor)
+        print('stsz count:', count)
+        deltas = calc_item_delta(stsz.table)
+        repn = guess_sequence_repitition_length(deltas)
+        offset = len(deltas) % repn
+        for i in range(count-len(stsz.table)):
+          delta = deltas[offset+(i%repn)]
+          stsz.table.append(stsz.table[-1]+delta)
+        stsz_atom.data = stsz.pack()
+        updated_atoms.append(stsz_atom)
 
   print('Updated moov atoms:', ', '.join(x.tag.decode('ascii', 'ignore') for x in updated_atoms))
+  #return
+
 
   # Write the reference file's atoms and the mdat from the broken file.
   for atom in reference_atoms.values():
@@ -439,7 +235,10 @@ def main():
   parser.add_argument('file')
   parser.add_argument('-o', '--output', help='The repaired output file.')
   parser.add_argument('-R', '--repair', help='A file to repair using the input file.')
+  parser.add_argument('--dump-moov', help='Specify an output file for the .moov atom dump.')
   args = parser.parse_args()
+
+
 
   if args.repair:
     if not args.output:
@@ -450,6 +249,30 @@ def main():
         open(args.repair, 'rb') as broken, \
         open(args.output, 'wb') as output:
       return repair_file(reference, broken, output)
+  elif args.dump_moov:
+    def transform(node):
+      if isinstance(node, tuple) and type(node).__name__ in vars(movfile):
+        node = transform({'type': type(node).__name__, 'data': node._asdict()})
+      elif isinstance(node, list):
+        node = [transform(x) for x in node]
+      elif isinstance(node, dict):
+        node = {transform(k): transform(v) for k, v in node.items()}
+      return node
+
+    class Encoder(json.JSONEncoder):
+      def default(self, obj):
+        if isinstance(obj, bytes):
+          return repr(obj)
+        return json.JSONEncoder.default(self, obj)
+
+    with open(args.file, 'rb') as fp:
+      for atom in MovAtomR.make_root(fp).iter_atoms():
+        if atom.tag == b'moov':
+          moov = movfile.moov.unpack(atom.read_data())
+
+    with open(args.dump_moov, 'w') as fp:
+      json.dump(transform(moov), fp, indent=2, cls=Encoder)
+
   else:
     with open(args.file, 'rb') as fp:
       print('file size:', sizeof_fmt(get_file_size_via_seek(fp)))
