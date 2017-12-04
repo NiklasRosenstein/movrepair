@@ -389,23 +389,27 @@ def repair_file(reference, broken, output):
 
   # Find a new duration for the new file based on the size of the reference
   # file's duration and sample size in bytes.
-  def get_new_duration(data):
-    time_scale, ref_duration = struct.unpack('>II', data[12:20])
+  def get_new_duration(atom):
+    time_scale, ref_duration = struct.unpack('>II', atom.data[12:20])
     new_duration = int(round(mdat.size / reference_atoms[b'mdat'].size * ref_duration))
-    print('Adjusting duration from {}s to {}s.'.format(ref_duration/time_scale, new_duration/time_scale))
+    print('Adjusting "{}" duration from {}s to {}s.'.format(
+        atom.tag.decode('ascii', 'ignore'),
+        ref_duration/time_scale,
+        new_duration/time_scale))
     return new_duration
   moov = reference_atoms[b'moov']
   mvhd = moov.find_atoms(b'mvhd')[0]
-  new_duration = get_new_duration(mvhd.data)
+  new_duration = get_new_duration(mvhd)
   new_duration_packed = struct.pack('>I', new_duration)
 
-  print('*', mvhd)
+  updated_atoms = []
   mvhd.edit()[16:20] = new_duration_packed
+  updated_atoms.append(mvhd)
   for tkhd in moov.find_atoms(b'trak', b'tkhd'):
-    print('*', tkhd)
+    updated_atoms.append(tkhd)
     tkhd.edit()[20:24] = new_duration_packed
   for elst in moov.find_atoms(b'trak', b'edts', b'elst'):
-    print('*', elst)
+    updated_atoms.append(elst)
     # NOTE: There could be multiple entries in the reference file or in the
     #       broken file. The former we don't care about, but the latter we
     #       can't know. We'll just assume one entry.
@@ -414,9 +418,10 @@ def repair_file(reference, broken, output):
     values = [flag, 1, new_duration, 0, rate]
     elst.edit()[:] = struct.pack('>IIIII', *values)
   for mdhd in moov.find_atoms(b'trak', b'mdia', b'mdhd'):
-    print('*', mdhd)
-    mdhd_duration = get_new_duration(mdhd.data)
-    mdhd.edit()[16:20] = struct.pack('>I', mdhd_duration)
+    updated_atoms.append(mdhd)
+    mdhd.edit()[16:20] = struct.pack('>I', get_new_duration(mdhd))
+
+  print('Updated moov atoms:', ', '.join(x.tag.decode('ascii', 'ignore') for x in updated_atoms))
 
   # Write the reference file's atoms and the mdat from the broken file.
   for atom in reference_atoms.values():
