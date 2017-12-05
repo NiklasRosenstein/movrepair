@@ -22,11 +22,18 @@ Attempt to repair the file:
     $ python movrepair.py reference.MOV --repair 0A3C0B00.MOV
     Output file: 0A3C0B00-fixed.MOV
     Broken file's mdat size adjusted from 1.4GiB to 297.5MiB
-    Adjusting "mvhd" duration from 4.5045s to 13.5400666667s.
-    Adjusting "mdhd" duration from 4.5045s to 13.5400625s.
-    Adjusting "mdhd" duration from 4.5045s to 13.5400666667s.
-    Adjusting "mdhd" duration from 4.5045s to 13.5400666667s.
-    Updated moov atoms: mvhd, tkhd, tkhd, tkhd, elst, elst, elst, mdhd, mdhd, mdhd
+    Adjusting "mvhd" duration from 4.5045s to 13.540166666666666s.
+    Adjusting "mdhd" duration from 4.5045s to 13.540166666666666s.
+    Adjusting "mdhd" duration from 4.5045s to 13.540166666666666s.
+    Adjusting "mdhd" duration from 4.5045s to 13.540166666666666s.
+    Adjusting sample count from 216216 to 649928
+    Extending b'in24' chunk offset table
+    Adjusting sample count from 135 to 405
+    Extending b'AVdh' chunk offset table
+    Extending b'AVdh' sample size table
+    stsz count: 405
+    Removing tmcd track
+    Updated moov atoms: mvhd, tkhd, tkhd, tkhd, elst, elst, elst, mdhd, mdhd, mdhd, stts, stco, stts, stco, stsz
 
 If the "repaired" file still does not work, try using a video file that is
 at least as long as the file you're trying to repair and pass the
