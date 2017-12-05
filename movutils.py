@@ -66,6 +66,9 @@ class UnpackContext(object):
     self.init_values = {}
     self.parent = parent
 
+  def __getitem__(self, key):
+    return self.field_values[key]
+
 
 class Field(object):
   """
@@ -86,7 +89,7 @@ class Field(object):
     self.fmt = fmt
     self.getter = getter
     self.hidden = hidden
-    if not self.wraps_struct():
+    if not self.wraps_struct() and self.fmt is not None:
       try:
         self.fmt = struct.Struct(self.fmt)
       except struct.error as e:
@@ -118,7 +121,7 @@ class Field(object):
 
   def unpack_from_stream(self, ctx, fp):
     if self.wraps_struct():
-      return self.fmt.unpack_from_stream(fp)
+      return self.fmt.unpack_from_stream(fp, UnpackContext(self.fmt, ctx))
     else:
       data = fp.read(self.fmt.size)
       try:
@@ -156,6 +159,9 @@ class ListField(Field):
     super(ListField, self).__init__(name, fmt)
     self.times = times
 
+  def size(self):
+    return None
+
   def unpack_from_stream(self, ctx, fp):
     if isinstance(self.times, str):
       times = ctx.field_values[self.times]
@@ -167,6 +173,36 @@ class ListField(Field):
     for i in range(times):
       values.append(super(ListField, self).unpack_from_stream(ctx, fp))
     return values
+
+  def pack_into_stream(self, struct_type, fp, items):
+    for value in items:
+      super(ListField, self).pack_into_stream(struct_type, fp, value)
+
+
+class StringField(Field):
+
+  def __init__(self, name, length):
+    super(StringField, self).__init__(name, None)
+    self.length = length
+
+  def size(self):
+    return None
+
+  def unpack_from_stream(self, ctx, fp):
+    if isinstance(self.length, str):
+      length = ctx.field_values[self.length]
+    elif callable(self.length):
+      length = self.length(ctx)
+    else:
+      length = self.length
+    data = fp.read(length)
+    if len(data) != length:
+      raise UnpackError('{}.{} expected {} bytes (got {})'.format(
+          ctx.struct_type.__name__, self.name, length, len(data)))
+    return data
+
+  def pack_into_stream(self, struct_type, fp, data):
+    fp.write(data)
 
 
 class Struct(with_metaclass(InitSubclassMeta)):
@@ -214,7 +250,7 @@ class Struct(with_metaclass(InitSubclassMeta)):
   def __repr__(self):
     attrs = ((k.name, getattr(self, k.name)) for k in self._fields_ if k.name)
     attrs = ('{}={!r}'.format(k, v) for k, v in attrs)
-    return '<{} {}>'.format(type(self).__name__, ' '.join(attrs))
+    return '{}({})'.format(type(self).__name__, ', '.join(attrs))
 
   def __getattr__(self, name):
     field = self._fields_map_.get(name)
@@ -251,9 +287,41 @@ class Struct(with_metaclass(InitSubclassMeta)):
             break
     return result
 
+  def pretty_print(self, fp=None, indent='  ', depth=0):
+    if fp is None:
+      fp = sys.stdout
+    fp.write('{}(\n'.format(type(self).__name__))
+    for field_index, field in enumerate(self._fields_):
+      if not field.name: continue
+      fp.write(indent * (depth+1) + '{}='.format(field.name))
+      value = getattr(self, field.name)
+      if isinstance(value, Struct):
+        value.pretty_print(fp, indent, depth+1)
+      elif isinstance(value, list):
+        fp.write('[\n')
+        for i, item in enumerate(value):
+          fp.write(indent * (depth+2))
+          if isinstance(item, Struct):
+            item.pretty_print(fp, indent, depth+2)
+          else:
+            fp.write(repr(item))
+          if i != len(value)-1:
+            fp.write(',')
+          fp.write('\n')
+        fp.write(indent * (depth+1) + ']')
+      else:
+        fp.write('{!r}'.format(value))
+      if field_index != len(self._fields_)-1:
+        fp.write(',')
+      fp.write('\n')
+    fp.write(indent * depth + ')')
+    if depth == 0:
+      fp.write('\n')
+
   @classmethod
-  def unpack_from_stream(cls, fp, parent=None):
-    ctx = UnpackContext(cls, parent)
+  def unpack_from_stream(cls, fp, ctx=None):
+    if ctx is None:
+      ctx = UnpackContext(cls)
     for field in cls._fields_:
       value = field.unpack_from_stream(ctx, fp)
       ctx.field_values[field.name] = value
@@ -262,8 +330,8 @@ class Struct(with_metaclass(InitSubclassMeta)):
     return cls(**ctx.init_values)
 
   @classmethod
-  def unpack(cls, data, parent=None):
-    return cls.unpack_from_stream(io.BytesIO(data), parent)
+  def unpack(cls, data, ctx=None):
+    return cls.unpack_from_stream(io.BytesIO(data), ctx)
 
   def pack_into_stream(self, fp):
     for field in self._fields_:
