@@ -23,10 +23,9 @@
 
 from __future__ import division, print_function
 from movio import MovFileError, MovAtomR, MovAtomD, MovAtomW, get_file_size_via_seek
-import movfile
+import movatoms
 import argparse
 import collections
-import json
 import os
 import struct
 import sys
@@ -61,7 +60,119 @@ def sizeof_fmt(num, suffix='B'):
   return "%.1f%s%s" % (num, 'Yi', suffix)
 
 
-def repair_file(reference, broken, output):
+def fix_metadata(scale_factor, moov):
+  """
+  Attempts to update the metadata in the `moov` atom, scaling the duration
+  and sample counts by the specified *scale_factor*.
+
+  The following atom types will be updated:
+
+  * mvhd
+  * trak > tkhd
+  * trak > edts > elst
+  * trak > mdia > mdhd
+  * trak > mdia > minf > {stts, stco, stsz}
+
+  Any time-code track (with data_format `tmcd`) will be removed.
+  """
+
+  updated_atoms = []
+
+  # Find a new duration for the new file based on the size of the reference
+  # file's duration and sample size in bytes.
+  def get_new_duration(atom):
+    time_scale, ref_duration = struct.unpack('>II', atom.data[12:20])
+    new_duration = int(scale_factor * ref_duration)
+    print('Adjusting "{}" duration from {}s to {}s.'.format(
+        atom.tag.decode('ascii', 'ignore'),
+        ref_duration/time_scale,
+        new_duration/time_scale))
+    return ref_duration, new_duration
+  mvhd = moov.find_atoms(b'mvhd')[0]
+  ref_duration, new_duration = get_new_duration(mvhd)
+  new_duration_packed = struct.pack('>I', new_duration)
+
+  mvhd.edit()[16:20] = new_duration_packed
+  updated_atoms.append(mvhd)
+  for tkhd in moov.find_atoms(b'trak', b'tkhd'):
+    updated_atoms.append(tkhd)
+    tkhd.edit()[20:24] = new_duration_packed
+  for elst in moov.find_atoms(b'trak', b'edts', b'elst'):
+    updated_atoms.append(elst)
+    # NOTE: There could be multiple entries in the reference file or in the
+    #       broken file. The former we don't care about, but the latter we
+    #       can't know. We'll just assume one entry.
+    flag = struct.unpack('>I', elst.data[:4])[0]
+    rate = struct.unpack('>I', elst.data[16:20])[0]
+    values = [flag, 1, new_duration, 0, rate]
+    elst.edit()[:] = struct.pack('>IIIII', *values)
+  for mdhd in moov.find_atoms(b'trak', b'mdia', b'mdhd'):
+    updated_atoms.append(mdhd)
+    mdhd_dur = get_new_duration(mdhd)[1]
+    mdhd.edit()[16:20] = struct.pack('>I', mdhd_dur)
+
+  # Adjust the sample information for the changed duration and sample count.
+  for minf in moov.find_atoms(b'trak', b'mdia', b'minf'):
+    vmhd = next(iter(minf.find_atoms(b'vmhd')), None)
+    for stbl in minf.find_atoms(b'stbl'):
+
+      # Sample description atom
+      desc_atom = stbl.find_atoms(b'stsd')[0]
+      desc = movatoms.stsd.unpack(desc_atom.data)
+      data_format = desc.descriptions[0].data_format
+
+      if data_format == b'tmcd':
+        print('Removing tmcd track')
+        assert minf.parent.parent.tag == b'trak'
+        moov.atoms.remove(minf.parent.parent)
+
+      # Time-to-sample atom
+      stts_atom = stbl.find_atoms(b'stts')[0]
+      stts = movatoms.stts.unpack(stts_atom.data)
+      if data_format != b'tmcd':
+        table = []
+        for nsamples, sample_duration in stts.table:
+          nsamples_new = int(nsamples * scale_factor)
+          print('Adjusting sample count from {} to {}'.format(nsamples, nsamples_new))
+          table.append((nsamples_new, sample_duration))
+        stts_atom.data = stts.pack()
+        updated_atoms.append(stts_atom)
+
+      # Chunk Offset atom
+      stco_atom = stbl.find_atoms(b'stco')[0]
+      stco = movatoms.stco.unpack(stco_atom.data)
+      if len(stco.table) > 1:
+        print('Extending {} chunk offset table'.format(data_format))
+        count = int(len(stco.table) * scale_factor)
+        deltas = calc_item_delta(stco.table)
+        repn = guess_sequence_repitition_length(deltas)
+        offset = len(deltas) % repn
+        for i in range(count-len(stco.table)):
+          delta = deltas[offset+(i%repn)]
+          stco.table.append(stco.table[-1]+delta)
+        stco_atom.data = stco.pack()
+        updated_atoms.append(stco_atom)
+
+      # Sample Size atom
+      stsz_atom = stbl.find_atoms(b'stsz')[0]
+      stsz = movatoms.stsz.unpack(stsz_atom.data)
+      if len(stsz.table) > 1:
+        print('Extending {} sample size table'.format(data_format))
+        count = int(len(stsz.table) * scale_factor)
+        print('stsz count:', count)
+        deltas = calc_item_delta(stsz.table)
+        repn = guess_sequence_repitition_length(deltas)
+        offset = len(deltas) % repn
+        for i in range(count-len(stsz.table)):
+          delta = deltas[offset+(i%repn)]
+          stsz.table.append(stsz.table[-1]+delta)
+        stsz_atom.data = stsz.pack()
+        updated_atoms.append(stsz_atom)
+
+  print('Updated moov atoms:', ', '.join(x.tag.decode('ascii', 'ignore') for x in updated_atoms))
+
+
+def repair_file(reference, broken, output, do_fix_metadata=True):
   """
   Tries to repair the *broken* file using the *reference* file and writes it
   to the *output* file. This function will transfer all sections from the
@@ -110,114 +221,10 @@ def repair_file(reference, broken, output):
       sizeof_fmt(mdat.size), sizeof_fmt(mdat_size)))
   mdat.size = mdat_size
 
-  # TESTING
-  moov = movfile.moov.unpack(reference_atoms[b'moov'].data)
-  print(moov)
-  return
-
-  # Find a new duration for the new file based on the size of the reference
-  # file's duration and sample size in bytes.
-  def get_new_duration(atom):
-    time_scale, ref_duration = struct.unpack('>II', atom.data[12:20])
-    new_duration = int(mdat.size / reference_atoms[b'mdat'].size * ref_duration)
-    print('Adjusting "{}" duration from {}s to {}s.'.format(
-        atom.tag.decode('ascii', 'ignore'),
-        ref_duration/time_scale,
-        new_duration/time_scale))
-    return ref_duration, new_duration
-  moov = reference_atoms[b'moov']
-  mvhd = moov.find_atoms(b'mvhd')[0]
-  ref_duration, new_duration = get_new_duration(mvhd)
-  new_duration_packed = struct.pack('>I', new_duration)
-
-  updated_atoms = []
-  mvhd.edit()[16:20] = new_duration_packed
-  updated_atoms.append(mvhd)
-  for tkhd in moov.find_atoms(b'trak', b'tkhd'):
-    updated_atoms.append(tkhd)
-    tkhd.edit()[20:24] = new_duration_packed
-  for elst in moov.find_atoms(b'trak', b'edts', b'elst'):
-    updated_atoms.append(elst)
-    # NOTE: There could be multiple entries in the reference file or in the
-    #       broken file. The former we don't care about, but the latter we
-    #       can't know. We'll just assume one entry.
-    flag = struct.unpack('>I', elst.data[:4])[0]
-    rate = struct.unpack('>I', elst.data[16:20])[0]
-    values = [flag, 1, new_duration, 0, rate]
-    elst.edit()[:] = struct.pack('>IIIII', *values)
-  for mdhd in moov.find_atoms(b'trak', b'mdia', b'mdhd'):
-    updated_atoms.append(mdhd)
-    mdhd_dur = get_new_duration(mdhd)[1]
-    mdhd.edit()[16:20] = struct.pack('>I', mdhd_dur)
-
-  # Adjust the sample information for the changed duration and sample count.
-  scale_factor = new_duration / ref_duration
-  for minf in moov.find_atoms(b'trak', b'mdia', b'minf'):
-    vmhd = next(iter(minf.find_atoms(b'vmhd')), None)
-    for stbl in minf.find_atoms(b'stbl'):
-
-      # Sample description atom
-      desc_atom = stbl.find_atoms(b'stsd')[0]
-      desc = movfile.stsd.unpack(desc_atom.data)
-
-      if desc.desc[0].fmt == b'tmcd':
-        print('Removing tmcd track')
-        assert minf.parent.parent.tag == b'trak'
-        moov.atoms.remove(minf.parent.parent)
-
-      # Time-to-sample atom
-      stts_atom = stbl.find_atoms(b'stts')[0]
-      stts = movfile.stts.unpack(stts_atom.data)
-      if desc.desc[0].fmt != b'tmcd':
-        table = []
-        for nsamples, sample_duration in stts.table:
-          nsamples_new = int(nsamples * scale_factor)
-          print('Adjusting sample count from {} to {}'.format(nsamples, nsamples_new))
-          table.append((nsamples_new, sample_duration))
-        stts_atom.data = stts.pack()
-        updated_atoms.append(stts_atom)
-
-      # Sync Sample atom
-      #stss_atom = stbl.find_atoms(b'stss')[0]
-      #stss = StssAtom.unpack(stss_atom.data)
-
-      # Sample-to-chunk atom
-      stsc_atom = stbl.find_atoms(b'stsc')[0]
-      stsc = movfile.stsc.unpack(stsc_atom.data)
-
-      # Chunk Offset atom
-      stco_atom = stbl.find_atoms(b'stco')[0]
-      stco = movfile.stco.unpack(stco_atom.data)
-      if len(stco.table) > 1:
-        print('Extending {} chunk offset table'.format(desc.desc[0].fmt))
-        count = int(len(stco.table) * scale_factor)
-        deltas = calc_item_delta(stco.table)
-        repn = guess_sequence_repitition_length(deltas)
-        offset = len(deltas) % repn
-        for i in range(count-len(stco.table)):
-          delta = deltas[offset+(i%repn)]
-          stco.table.append(stco.table[-1]+delta)
-        updated_atoms.append(stco_atom)
-
-      # Sample Size atom
-      stsz_atom = stbl.find_atoms(b'stsz')[0]
-      stsz = movfile.stsz.unpack(stsz_atom.data)
-      if len(stsz.table) > 1:
-        print('Extending {} sample size table'.format(desc.desc[0].fmt))
-        count = int(len(stsz.table) * scale_factor)
-        print('stsz count:', count)
-        deltas = calc_item_delta(stsz.table)
-        repn = guess_sequence_repitition_length(deltas)
-        offset = len(deltas) % repn
-        for i in range(count-len(stsz.table)):
-          delta = deltas[offset+(i%repn)]
-          stsz.table.append(stsz.table[-1]+delta)
-        stsz_atom.data = stsz.pack()
-        updated_atoms.append(stsz_atom)
-
-  print('Updated moov atoms:', ', '.join(x.tag.decode('ascii', 'ignore') for x in updated_atoms))
-  #return
-
+  # Update the duration and sample counts in the metadata.
+  if do_fix_metadata:
+    scale_factor = mdat.size / reference_atoms[b'mdat'].size
+    fix_metadata(scale_factor, reference_atoms[b'moov'])
 
   # Write the reference file's atoms and the mdat from the broken file.
   for atom in reference_atoms.values():
@@ -232,15 +239,26 @@ def repair_file(reference, broken, output):
 
 def main():
   parser = argparse.ArgumentParser()
-  parser.add_argument('file')
-  parser.add_argument('-o', '--output', help='The repaired output file.')
-  parser.add_argument('-R', '--repair', help='A file to repair using the input file.')
-  parser.add_argument('--dump-moov', help='Specify an output file for the .moov atom dump.')
+  parser.add_argument('file', help='A working video file. If no additional '
+    'options are specified, the to-level atoms of this file will be displayed.')
+  parser.add_argument('-o', '--output', help='The repaired output filename.')
+  parser.add_argument('-R', '--repair',
+    help='A file to repair using the working input file.')
+  parser.add_argument('--no-fix-metadata', action='store_true',
+    help='Don\'t try to fix the `moov` atom metadata duration and sample '
+      'counts. This will require the input FILE to be the same length or '
+      'longer than the REPAIR file.')
+  parser.add_argument('--dump-moov', action='store_true',
+    help='Dump the input FILE\'s `moov` atom to stdout.')
   args = parser.parse_args()
 
-
-
-  if args.repair:
+  if args.dump_moov:
+    with open(args.file, 'rb') as fp:
+      for atom in MovAtomR.make_root(fp).iter_atoms():
+        if atom.tag == b'moov':
+          moov = movatoms.moov.unpack(atom.read_data())
+    moov.pretty_print()
+  elif args.repair:
     if not args.output:
       name, ext = os.path.splitext(args.repair)
       args.output = name + '-fixed' + ext
@@ -248,33 +266,7 @@ def main():
     with open(args.file, 'rb') as reference, \
         open(args.repair, 'rb') as broken, \
         open(args.output, 'wb') as output:
-      return repair_file(reference, broken, output)
-  elif args.dump_moov:
-    def transform(node):
-      if isinstance(node, tuple) and type(node).__name__ in vars(movfile):
-        node = transform({'type': type(node).__name__, 'data': node._asdict()})
-      elif isinstance(node, tuple) and hasattr(node, '_asdict'):
-        node = transform(node._asdict())
-      elif isinstance(node, list):
-        node = [transform(x) for x in node]
-      elif isinstance(node, dict):
-        node = {transform(k): transform(v) for k, v in node.items()}
-      return node
-
-    class Encoder(json.JSONEncoder):
-      def default(self, obj):
-        if isinstance(obj, bytes):
-          return repr(obj)
-        return json.JSONEncoder.default(self, obj)
-
-    with open(args.file, 'rb') as fp:
-      for atom in MovAtomR.make_root(fp).iter_atoms():
-        if atom.tag == b'moov':
-          moov = movfile.moov.unpack(atom.read_data())
-
-    with open(args.dump_moov, 'w') as fp:
-      json.dump(transform(moov), fp, indent=2, cls=Encoder)
-
+      return repair_file(reference, broken, output, do_fix_metadata=not args.no_fix_metadata)
   else:
     with open(args.file, 'rb') as fp:
       print('file size:', sizeof_fmt(get_file_size_via_seek(fp)))

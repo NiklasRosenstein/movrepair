@@ -22,6 +22,7 @@
 
 from movio import MovAtomR, MovAtomW
 from movutils import UnpackContext, Field, ListField, StringField, Struct
+import logging
 import collections
 import struct
 import sys
@@ -60,8 +61,8 @@ class SubAtomsField(Field):
           raise RuntimeError('unpacked atom is not in reverse table')
         result.append(atom_obj)
       else:
-        print('warning: unsupported atom type in {}: {!r}'.format(
-            ctx.struct_type.__name__, atom.tag))
+        logging.warn('Encountered unsupported atom type "{!r}" '
+            'while unpacking {}.'.format(atom.tag, ctx.struct_type.__name__))
     return result
 
   def pack_into_stream(self, struct_type, fp, atoms):
@@ -154,7 +155,7 @@ class stts(Struct):  # Time-to-Sample Atom
 class sample_description(Struct):
   _fields_ = [
     Field('size?', '>I', lambda s: len(s.data) + 16),
-    Field('data_format', '>I'),
+    StringField('data_format', length=4),
     Field('?', '6x'),
     Field('data_reference_index', '>H'),
     StringField('data', length=lambda ctx: ctx['size'] - 16)
