@@ -1,8 +1,10 @@
 ## movrepair
 
 Movrepair is a script that attempts to repair a broken `.mov` file. In my
-specific use-case, the size-header of the `mdat` atom was broken, also leading
-to the destruction of following atoms.
+specific use-case, the video files appeared to be truncated in the middle
+of the Movie Data atom (`mdat`), rendering the size of the `mdat` atom header
+too large, and all following atoms were missing (e.g. the important Movie Atom
+`moov` with all metadata).
 
 This script will take a *working* reference video file and copy all atoms
 except for the `mdat` atom, which will be used from the broken input file.
