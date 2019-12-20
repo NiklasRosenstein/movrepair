@@ -145,8 +145,8 @@ class Field(object):
       try:
         fp.write(self.fmt.pack(*value))
       except struct.error as e:
-        raise PackError('field {}.{}: {}'.format(
-            struct_type.__name__, self.name, e))
+        raise PackError('field {}.{} (value: {!r}): {}'.format(
+            struct_type.__name__, self.name, value, e))
 
 
 class ListField(Field):
