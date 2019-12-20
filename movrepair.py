@@ -31,9 +31,6 @@ import struct
 import sys
 
 
-
-
-
 def guess_sequence_repitition_length(seq):
   # Thanks to https://stackoverflow.com/a/11385797/791713
   guess = 1
@@ -157,11 +154,11 @@ def fix_metadata(scale_factor, moov):
       stsz_atom = stbl.find_atoms(b'stsz')[0]
       stsz = movatoms.stsz.unpack(stsz_atom.data)
       if len(stsz.table) > 1:
-        print('Extending {} sample size table'.format(data_format))
         count = int(len(stsz.table) * scale_factor)
-        print('stsz count:', count)
         deltas = calc_item_delta(stsz.table)
         repn = guess_sequence_repitition_length(deltas)
+        print('Extending {} sample size table (table size: {}, guesssed repartition length: {})'
+              .format(data_format, repn))
         offset = len(deltas) % repn
         for i in range(count-len(stsz.table)):
           delta = deltas[offset+(i%repn)]
@@ -223,7 +220,8 @@ def repair_file(reference, broken, output, do_fix_metadata=True):
 
   # Update the duration and sample counts in the metadata.
   if do_fix_metadata:
-    scale_factor = mdat.size / reference_atoms[b'mdat'].size
+    scale_factor = mdat.size / float(reference_atoms[b'mdat'].size)
+    print('Scale factor to fix metadata:', scale_factor)
     fix_metadata(scale_factor, reference_atoms[b'moov'])
 
   # Write the reference file's atoms and the mdat from the broken file.
