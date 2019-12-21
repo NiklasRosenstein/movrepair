@@ -158,7 +158,7 @@ def fix_metadata(scale_factor, moov):
         deltas = calc_item_delta(stsz.table)
         repn = guess_sequence_repitition_length(deltas)
         print('Extending {} sample size table (table size: {}, guesssed repartition length: {})'
-              .format(data_format, repn))
+              .format(data_format, len(stsz.table), repn))
         offset = len(deltas) % repn
         for i in range(count-len(stsz.table)):
           delta = deltas[offset+(i%repn)]
